@@ -210,13 +210,18 @@ public enum CoreConfiguration {
     /// icon. The share sheet where the build shows one: on iPhone and iPad,
     /// not on a Mac. A sign-in session only when it
     /// can come back: on the app's own scheme, or on a link of the origin the
-    /// build has the associated domain for. A confirmation with a passkey, Sign
-    /// in with Apple and push only when the build is signed for them.
+    /// build has the associated domain for. A passkey (signing in with one,
+    /// making one, a confirmation signed with one), Sign in with Apple and
+    /// push only when the build is signed for them. The core asks the server
+    /// for a passkey's options and hands them over with the call, as it does
+    /// a confirmation's challenge; `passkey_options`, listed with `passkey`,
+    /// says this build shows the sheet with them. A server offers a passkey
+    /// call only to a build that lists both.
     public static func caps(signedWith: Set<Entitlement>, signInScheme: String?) -> [String] {
         var caps = ["clipboard", "local_notification", "open_settings", "open_url", "request_review"]
         if DeviceCalls.shares { caps.append("share") }
         if signInScheme != nil || signedWith.contains(.associatedDomains) { caps.append("auth_session") }
-        if signedWith.contains(.associatedDomains) { caps.append("confirm") }
+        if signedWith.contains(.associatedDomains) { caps += ["confirm", "passkey", "passkey_options"] }
         if signedWith.contains(.signInWithApple) { caps.append("platform_sign_in") }
         if signedWith.contains(.pushNotifications) { caps.append("push") }
         return caps.sorted()
@@ -226,7 +231,17 @@ public enum CoreConfiguration {
     /// false the core keeps nothing between launches: for a window beside
     /// the app's main ones, whose core would otherwise write its own list of
     /// pages over theirs in the one store they share.
-    public static func json(_ configuration: ShellConfiguration, device: DeviceTraits, keeps: Bool = true) -> Data {
+    ///
+    /// `secret` is the secret of this install, as hex, which the core makes
+    /// its key for a person with; a caller that gives none is given plain
+    /// keys. `oldKey` says that the person the session wrote down is written
+    /// down by a plain key, made before the install had a secret: the core
+    /// then says what the plain key of the person it names was. It is said
+    /// only with a secret.
+    public static func json(
+        _ configuration: ShellConfiguration, device: DeviceTraits, keeps: Bool = true, secret: String? = nil,
+        oldKey: Bool = false
+    ) -> Data {
         var signIn: [String: Any] = [
             "paths": configuration.signInPaths,
             // Apple's own sheet signs in with Apple; any other provider goes the web's way.
@@ -252,6 +267,10 @@ public enum CoreConfiguration {
             "sign_in": signIn,
         ]
         if configuration.loopbackHTTP { config["loopback_http"] = true }
+        if let secret {
+            config["secret"] = secret
+            if oldKey { config["old_key"] = true }
+        }
         return (try? JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])) ?? Data()
     }
 }

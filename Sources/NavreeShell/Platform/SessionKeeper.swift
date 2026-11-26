@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import NavreeProtocol
 import NavreeRuntime
+import Security
 import WebKit
 import os
 
@@ -63,7 +64,7 @@ import os
 /// `forget_session` that follows finds the work done and does none of it again.
 ///
 /// A start that finds the mark does the same again before the Keychain
-/// is read or anything kept is opened (``open(origin:loopbackHTTP:slot:cache:snapshots:files:record:removes:)``),
+/// is read or anything kept is opened (``open(origin:loopbackHTTP:slot:install:cache:snapshots:files:record:removes:)``),
 /// and takes nothing from the Keychain in that run. The stores of sessions
 /// that ended are removed when the system lets them be (no web view may still
 /// use one), and what could not be removed is tried again at each start.
@@ -96,6 +97,9 @@ final class SessionKeeper {
     private let origin: String?
     private let loopbackHTTP: Bool
     private let slot: (any SecretSlot)?
+    /// Where the install's secret is kept: a Keychain item of its own,
+    /// beside the session's and never the session's.
+    private let secretSlot: (any SecretSlot)?
     private let record: SessionRecord?
     private let removes: @MainActor (UUID) async -> Bool
     /// Whether the jar, when it is first made, takes what the Keychain holds.
@@ -165,9 +169,12 @@ final class SessionKeeper {
     /// A session over `jar` (or, with `origin`, a jar made when a transport
     /// first asks for one), keeping its pages in `cache` and its windows in
     /// `snapshots`. With a `record`, its end survives the app ending in the
-    /// middle of it and its web view store is kept between launches.
+    /// middle of it and its web view store is kept between launches. With
+    /// `install`, the install's secret is kept there between launches;
+    /// without, the session has a secret of its own for as long as it lives.
     init(
         jar: CookieJar? = nil, origin: String? = nil, loopbackHTTP: Bool = false, slot: (any SecretSlot)? = nil,
+        install: (any SecretSlot)? = nil,
         cache: KeptFiles, snapshots: KeptFiles, files: FileStore = .shared, record: SessionRecord? = nil,
         removes: @escaping @MainActor (UUID) async -> Bool = SessionKeeper.removeSystemStore
     ) {
@@ -175,6 +182,7 @@ final class SessionKeeper {
         self.origin = origin
         self.loopbackHTTP = loopbackHTTP
         self.slot = slot
+        secretSlot = install
         self.cache = cache
         self.snapshots = snapshots
         self.files = files
@@ -194,13 +202,13 @@ final class SessionKeeper {
     /// that ended are removed, and a folder standing among the kept files
     /// (none of them is one) is deleted.
     static func open(
-        origin: String, loopbackHTTP: Bool = false, slot: (any SecretSlot)? = nil, cache: KeptFiles,
-        snapshots: KeptFiles, files: FileStore = .shared, record: SessionRecord? = nil,
+        origin: String, loopbackHTTP: Bool = false, slot: (any SecretSlot)? = nil, install: (any SecretSlot)? = nil,
+        cache: KeptFiles, snapshots: KeptFiles, files: FileStore = .shared, record: SessionRecord? = nil,
         removes: @escaping @MainActor (UUID) async -> Bool = SessionKeeper.removeSystemStore
     ) -> SessionKeeper {
         let keeper = SessionKeeper(
-            origin: origin, loopbackHTTP: loopbackHTTP, slot: slot, cache: cache, snapshots: snapshots, files: files,
-            record: record, removes: removes
+            origin: origin, loopbackHTTP: loopbackHTTP, slot: slot, install: install, cache: cache, snapshots: snapshots,
+            files: files, record: record, removes: removes
         )
         if let record, let marked = record.marked() {
             if marked >= record.serial() {
@@ -231,6 +239,7 @@ final class SessionKeeper {
             }
         }
         keeper.person = record?.person()
+        keeper.keepsPlainKey = keeper.person?.keepsPlainKey ?? false
         cache.clearFolders()
         snapshots.clearFolders()
         keeper.removeRetired()
@@ -252,6 +261,8 @@ final class SessionKeeper {
         let keeper = open(
             origin: origin, loopbackHTTP: loopbackHTTP,
             slot: keepsSession ? KeychainSlot(service: CookieJar.service, account: origin) : nil,
+            // The install's secret is the install's and not the session's: it is kept also where the session is not.
+            install: KeychainSlot(service: SessionKeeper.secretService, account: origin, what: "the install's secret"),
             cache: KeptFiles(Session.cacheFolder(origin), in: .cachesDirectory), snapshots: KeptFiles("navree-snapshot"),
             record: SessionRecord(origin: origin, keepsWebStore: keepsSession)
         )
@@ -526,6 +537,31 @@ final class SessionKeeper {
             default: false
             }
         }
+
+        /// What a key the core made with the install's secret begins with.
+        /// Any other key is a plain one: a hash anybody can make again,
+        /// which the core made before the install had a secret.
+        static let keyed = "k2:"
+
+        /// Whether the key written down is a plain one. While one is, the
+        /// core is asked to say what the plain key of the person it names
+        /// was (`old_key` in its configuration).
+        var keepsPlainKey: Bool {
+            key.map { !$0.hasPrefix(Person.keyed) } ?? false
+        }
+
+        /// Whether this person, written down by their plain key, is the
+        /// person `now`, whom the core names by a key made with the
+        /// install's secret: the core says what the plain key of `now` was
+        /// (`app.user_was`), and it is the key written down. The one rule by
+        /// which two keys are one person's, and it holds once: `now` is
+        /// written down in this one's place. A core that says no plain key,
+        /// or another, leaves them two people.
+        func isPlain(of now: Person, was: String?) -> Bool {
+            guard let mine = key, keepsPlainKey, let theirs = now.key, theirs.hasPrefix(Person.keyed) else { return false }
+            guard let was, !was.isEmpty else { return false }
+            return mine == was
+        }
     }
 
     /// The mark of a person, made from the name and the address a core
@@ -551,7 +587,13 @@ final class SessionKeeper {
     /// when all of it went: an app ended in the middle, or a part that
     /// failed, leaves the person before written down, and the next start
     /// does the change over.
-    func hears(_ now: Person, from window: SystemEffects) {
+    ///
+    /// `was` is what the core says the plain key of the person it names was
+    /// (`app.user_was`), where it says. The person written down by that
+    /// plain key is the same person under the key the core makes now
+    /// (``Person/isPlain(of:was:)``): nothing of theirs goes, and they are
+    /// written down by the key they have now. It is compared and never kept.
+    func hears(_ now: Person, was: String? = nil, from window: SystemEffects) {
         guard let before = person else {
             person = now
             if keeps() { _ = record?.keep(person: now) }
@@ -559,12 +601,75 @@ final class SessionKeeper {
         }
         guard before != now else { return }
         person = now
-        // The same person under another name (the same key) is only written
-        // down as they are named now.
-        if before.isSame(as: now) || personChanged(by: window) {
+        // The same person under another name (the same key), or under the
+        // key the core makes with the install's secret where their plain
+        // key was written down, is only written down as they are named now.
+        if before.isSame(as: now) || before.isPlain(of: now, was: was) || personChanged(by: window) {
             if keeps() { _ = record?.keep(person: now) }
         }
     }
+
+    // MARK: - The install's secret
+
+    /// The service the install's secret is kept under in the Keychain: an
+    /// item of its own, which the end of a session never deletes.
+    static let secretService = "com.navree.native.session.install"
+
+    /// The secret of this install, which every window's core makes its key
+    /// for a person with (`secret` in the core's configuration): 32 bytes
+    /// from the system's secure random generator, as hex, made the first
+    /// time it is asked for.
+    ///
+    /// It is kept in the Keychain, in an item of its own
+    /// (``KeychainSlot``: readable after the first unlock, on this device
+    /// only, never synchronised and never in a backup restored elsewhere),
+    /// and nowhere else: not in the session's folder, which on a Mac any
+    /// program the person runs can read. A sign-out leaves it, so one person
+    /// has one key at every start, and the same person has another key on
+    /// every device.
+    ///
+    /// A build before this one kept it in a file of the session's folder.
+    /// Such a file is read once: its secret is put in the Keychain, so the
+    /// keys stay what they were, and the file is deleted, whether or not the
+    /// Keychain took it.
+    ///
+    /// Where the Keychain holds none, or what it holds cannot be read or is
+    /// no secret, a new one is made and written there. The client has no
+    /// way to stop a start for what it cannot read: what the Keychain does
+    /// not give is nothing to it, as for the session's cookies. The keys
+    /// made with a new secret are other keys, so the person named next is
+    /// another person than the one written down, and what was kept goes, as
+    /// it does for anybody else. A build with no Keychain of its own (a Mac
+    /// build with no application identifier) keeps none: its secret is the
+    /// run's alone, as its session is, and never goes into a file instead.
+    ///
+    /// It is a secret: it goes to the core and nowhere else, and is never
+    /// written to a log.
+    private(set) lazy var installSecret: String = takeInstallSecret()
+
+    private func takeInstallSecret() -> String {
+        if let data = secretSlot?.read() {
+            let held = String(decoding: data, as: UTF8.self)
+            if SessionRecord.reads(secret: held) {
+                // A file a build before left beside it is not read again.
+                record?.dropFileSecret()
+                return held
+            }
+        }
+        let secret = record?.fileSecret() ?? SessionRecord.newSecret()
+        secretSlot?.write(Data(secret.utf8))
+        record?.dropFileSecret()
+        return secret
+    }
+
+    /// Whether the person written down when this run opened the session was
+    /// written down by a plain key, made before the install had a secret:
+    /// every core made in this run is then asked to say what the plain key
+    /// of the person it names was (`old_key`), so that person is not taken
+    /// for another, and a window that is brought back later in the run still
+    /// finds its place. The next run, which reads the key they have now,
+    /// asks no more.
+    private(set) var keepsPlainKey = false
 
     /// The core of `window` names another person than the session's, and
     /// nobody signed out between. The cookies are the new person's already,
@@ -703,8 +808,12 @@ final class SessionKeeper {
 /// which session; the number of the session the device holds; the mark of
 /// the person what is kept is kept for; and which web view store is the
 /// session's and which belong to sessions that ended. Nothing in it is a
-/// secret, and it can be read whenever the Keychain item can (after the
-/// device's first unlock).
+/// secret: the session's cookies and the install's secret are kept in the
+/// Keychain, and a file in which a build before this one kept that secret
+/// here is read once, to move it there, and deleted
+/// (``SessionKeeper/installSecret``). It can be read whenever the Keychain
+/// items can (after the device's first unlock), and the folder is marked
+/// as one no backup takes each time something is written into it.
 struct SessionRecord: Sendable {
     let folder: URL
     /// Whether the session's web view store is kept between launches.
@@ -849,9 +958,55 @@ struct SessionRecord: Sendable {
         return write(list)
     }
 
+    private var install: URL { folder.appendingPathComponent("install") }
+
+    /// The install's secret as a build before this one kept it, in a file of
+    /// this folder: what the file holds, when it is there and holds a
+    /// secret. The secret is kept in the Keychain
+    /// (``SessionKeeper/installSecret``); this is read once, to move it
+    /// there, and nothing writes the file any more.
+    func fileSecret() -> String? {
+        guard let data = try? Data(contentsOf: install) else { return nil }
+        let held = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return SessionRecord.reads(secret: held) ? held : nil
+    }
+
+    /// Deletes the file a build before this one kept the install's secret
+    /// in. `false` when it is still there afterwards.
+    @discardableResult
+    func dropFileSecret() -> Bool {
+        try? FileManager.default.removeItem(at: install)
+        return !FileManager.default.fileExists(atPath: install.path)
+    }
+
+    /// How many bytes the install's secret has.
+    static let secretBytes = 32
+
+    /// A new secret, as hex.
+    static func newSecret() -> String {
+        var bytes = [UInt8](repeating: 0, count: secretBytes)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            // The system's own generator for Swift, which is a secure one on Apple's systems.
+            var generator = SystemRandomNumberGenerator()
+            bytes = (0..<secretBytes).map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Whether a text is a secret the core takes: hex, two characters a
+    /// byte, of at least ``secretBytes`` bytes.
+    static func reads(secret text: String) -> Bool {
+        text.count >= 2 * secretBytes && text.count % 2 == 0 && text.allSatisfy { $0.isASCII && $0.isHexDigit }
+    }
+
+    /// Makes the folder when it is not there, and marks it as one no backup
+    /// takes. It is marked each time, not only when it is made: a mark that
+    /// could not be set once is set the next time, and what is written
+    /// waits for it.
     private func prepare() throws {
-        guard !FileManager.default.fileExists(atPath: folder.path) else { return }
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: folder.path) {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         var folder = folder
