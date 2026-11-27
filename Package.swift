@@ -31,7 +31,7 @@ let package = Package(
 // that scripts/build-core.sh makes into NavreeCore.xcframework (never
 // committed; run it before the first build), and the Swift class over them.
 package.targets += [
-    .binaryTarget(name: "NavreeCore", url: "https://github.com/NavreeHQ/navree/releases/download/v1.6.0/NavreeCore.xcframework.zip", checksum: "0a844a79e194a4f17bd8be4dc6b994b9209ef466c2a533dc0d84f07c34aea3f2"),
+    .binaryTarget(name: "NavreeCore", url: "https://github.com/NavreeHQ/navree/releases/download/v1.7.0/NavreeCore.xcframework.zip", checksum: "73ef658edc6b4e81ca39503cb93ac569cf02f254408633d06e2ec4bb89698b5b"),
     .target(
         name: "NavreeCoreBridge",
         dependencies: ["NavreeCore"],
